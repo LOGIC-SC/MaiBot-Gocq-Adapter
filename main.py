@@ -90,4 +90,4 @@ if __name__ == "__main__":
     finally:
         if loop and not loop.is_closed():
             loop.close()
-        sys.exit(0)
+        sys.exit(1)
