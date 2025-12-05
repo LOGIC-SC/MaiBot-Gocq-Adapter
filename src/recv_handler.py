@@ -7,6 +7,8 @@ import json
 import websockets as Server
 from typing import List, Tuple, Optional, Dict, Any
 import uuid
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 from . import MetaEventType, RealMessageType, MessageType, NoticeType
 from maim_message import (
@@ -37,6 +39,7 @@ class RecvHandler:
     def __init__(self):
         self.server_connection: Server.ServerConnection = None
         self.interval = global_config.napcat_heartbeat_interval
+        self.maibot_connected = False  # 新增：MaiBot 连接状态
 
     async def handle_meta_event(self, message: dict) -> None:
         event_type = message.get("meta_event_type")
@@ -46,6 +49,7 @@ class RecvHandler:
                 self_id = message.get("self_id")
                 self.last_heart_beat = time.time()
                 logger.info(f"Bot {self_id} 连接成功")
+                self.maibot_connected = True
                 asyncio.create_task(self.check_heartbeat(self_id))
         elif event_type == MetaEventType.heartbeat:
             if message["status"].get("online") and message["status"].get("good"):
@@ -60,6 +64,7 @@ class RecvHandler:
             now_time = time.time()
             if now_time - self.last_heart_beat > self.interval + 3:
                 logger.warning(f"Bot {id} 连接已断开")
+                self.maibot_connected = False
                 break
             else:
                 logger.debug("心跳正常")
@@ -248,124 +253,86 @@ class RecvHandler:
         """
         处理实际消息
         Parameters:
-            raw_message: dict: 原始消息
+            real_message: dict: 实际消息
         Returns:
             seg_message: list[Seg]: 处理后的消息段列表
         """
-        real_message: str = raw_message.get("message")
-        logger.info(f"处理消息: {raw_message}")
+        real_message: list = raw_message.get("message")
         if not real_message:
             return None
         seg_message: List[Seg] = []
-        # 处理图片消息
-        # [CQ:image,file={Name},subType={消息类型},url={Image URL}]
-        # 提取图片消息的URL和文件名
-        image_pattern = r'\[CQ:image,file=(.*?),subType=(.*?),url=(.*?)\]'
-        import re
-        image_matches = re.findall(image_pattern, real_message)
-        logger.info(f"image_matches: {image_matches}")
-        # 处理图片消息，将图片URL添加到seg_message列表中，同时将图片消息从real_message中删除，防止重复处理
-        for i in image_matches:
-            url = i[2]
-            imgbase64 = await get_image_base64(url)
-            if imgbase64:
-                if i[1] == "0":
-                    seg_message.append(Seg(type="image", data=imgbase64))
-                elif i[1] == "1":
-                    seg_message.append(Seg(type="emoji", data=imgbase64))
-        # 处理纯文本消息
-        text_pattern = re.sub(image_pattern, '', real_message)
-        text_pattern = text_pattern.replace('"', '')
-        logger.info(f"text_pattern: {text_pattern}")
-        # 处理@消息
-        at_pattern = r'\[CQ:at,qq=(.*?)\]'
-        at_matches = re.findall(at_pattern, real_message)
-        logger.info(f"at_matches: {at_matches}")
-        for qq_id in at_matches:
-            user_info = await get_member_info(self.server_connection, raw_message.get('group_id'), qq_id)
-            if user_info:
-                nickname = user_info.get('nickname')
-                seg_message.append(Seg(type="text", data=f"@{nickname}({qq_id})"))
-            # 去除消息中的CQ:at标签
-            text_pattern = text_pattern.replace(f'[CQ:at,qq={qq_id}]', '')
-        # 处理引用消息
-        reply_pattern = r'\[CQ:reply,id=(.*?)\]'
-        reply_matches = re.findall(reply_pattern, real_message)
-        logger.info(f"reply_matches: {reply_matches}")
-        json_pattern = r'\[CQ:json,data=(.*?)\]'
-        json_matches = re.findall(json_pattern, real_message)
-        logger.info(f"json_matches: {json_matches}")
-        # 处理json消息
-        for json_data in json_matches:
-            # 存储未处理的json_data
-            unprocessed_json_data = json_data
-            # 转义
-            json_data = json_data.replace('&quot;', '"')
-            json_data = json_data.replace('&lt;', '<')
-            json_data = json_data.replace('&gt;', '>')
-            json_data = json_data.replace('&amp;', '&')
-            json_data = json_data.replace('&#44;', ',')
-            json_data = json_data.replace('&#91;', '[')
-            json_data = json_data.replace('&#93;', ']')
-            json_data = json_data.replace('&#123;', '{')
-            json_data = json_data.replace('&#125;', '}')
-            json_data = json_data.replace('&#46;', '.')
-            json_data = json_data.replace('&#58;', ':')
-            json_data = json_data.replace('&#45;', '-')
-            json_data = json_data.replace('&#43;', '+')
-            json_data = json_data.replace('&#61;', '=')
-            json_data = json_data.replace('&#39;', "'")
-            json_data = json_data.replace('&#34;', '"')
-            json_data = json_data.replace('&#47;', '/')
-            json_data = json_data.replace('&#92;', '\\')
-            json_data = json_data.replace('&#126;', '~')
-            json_data = json_data.replace('&#33;', '!')
-            json_data = json_data.replace('&#64;', '@')
-            try:
-                # 尝试解析JSON数据
-                json_data = json.loads(json_data)
-                # 查看群公告可能性
-                # 检测是否是群公告
-                # 去除消息中的CQ:json标签
-                text_pattern = text_pattern.replace(f'[CQ:json,data={json.dumps(unprocessed_json_data)}]', '')
-                logger.info(f"原始JSON数据：{json_data}")
-                if json_data.get('meta') and json_data.get('meta').get('mannounce'):
-                    # 提取群公告内容
-                    text = json_data.get('prompt')
-                    # 提取群公告时间
-                    time_stamp = json_data.get('meta').get('mannounce').get('ctime')
-                    time_stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time_stamp))
-                    user = await get_member_info(self.server_connection, raw_message.get('group_id'), json_data.get('meta').get('mannounce').get('uin'))
-                    if user:
-                        text = f"{user.get('nickname')}({user.get('user_id')})：{text}"
+        for sub_message in real_message:
+            sub_message: dict
+            sub_message_type = sub_message.get("type")
+            match sub_message_type:
+                case RealMessageType.text:
+                    ret_seg = await self.handle_text_message(sub_message)
+                    if ret_seg:
+                        seg_message.append(ret_seg)
                     else:
-                        text = f"未知用户：{text}"
-                    logger.info(f"群公告：{text} 发布时间：{time_stamp} 用户信息：{user}")
-                    seg_message.append(Seg(type="text", data=f"群公告：{text} 发布时间：{time_stamp} 用户信息：{user}"))
-                else:
-                    # 不是群公告，直接添加到消息段列表中
-                    seg_message.append(Seg(type="json", data=json_data))
-            except json.JSONDecodeError:
-                # 如果解析失败，直接添加到消息段列表中
-                seg_message.append(Seg(type="text", data=json_data))
-
-        for reply_id in reply_matches:
-            # 获取引用消息的详细信息
-            reply_message = await get_message_detail(self.server_connection, reply_id)
-            # 加入前缀
-            if reply_message:
-                logger.info(f"reply_message: {reply_message}")
-                # 加入前缀"回复 @xxx"
-                if reply_message.get('sender').get('user_id') == raw_message.get('user_id'):
-                    reply_message = f"回复 @{raw_message.get('sender').get('nickname')}：" + reply_message.get('message')
-                else:
-                    reply_message = f"回复 @{reply_message.get('sender').get('nickname')}：" + reply_message.get('message')
-                # 返回
-                seg_message.append(Seg(type="reply", data=reply_message))
-
-
-        if text_pattern.strip():
-            seg_message.append(Seg(type="text", data=text_pattern.strip()))
+                        logger.warning("text处理失败")
+                case RealMessageType.face:
+                    ret_seg = await self.handle_face_message(sub_message)
+                    if ret_seg:
+                        seg_message.append(ret_seg)
+                    else:
+                        logger.warning("face处理失败或不支持")
+                case RealMessageType.reply:
+                    if not in_reply:
+                        ret_seg = await self.handle_reply_message(sub_message)
+                        if ret_seg:
+                            seg_message += ret_seg
+                        else:
+                            logger.warning("reply处理失败")
+                case RealMessageType.image:
+                    ret_seg = await self.handle_image_message(sub_message)
+                    if ret_seg:
+                        seg_message.append(ret_seg)
+                    else:
+                        logger.warning("image处理失败")
+                case RealMessageType.record:
+                    ret_seg = await self.handle_record_message(sub_message)
+                    if ret_seg:
+                        seg_message.clear()
+                        seg_message.append(ret_seg)
+                        break  # 使得消息只有record消息
+                    else:
+                        logger.warning("record处理失败或不支持")
+                case RealMessageType.video:
+                    logger.warning("不支持视频解析")
+                case RealMessageType.at:
+                    ret_seg = await self.handle_at_message(
+                        sub_message,
+                        raw_message.get("self_id"),
+                        raw_message.get("group_id"),
+                    )
+                    if ret_seg:
+                        seg_message.append(ret_seg)
+                    else:
+                        logger.warning("at处理失败")
+                case RealMessageType.rps:
+                    logger.warning("暂时不支持猜拳魔法表情解析")
+                case RealMessageType.dice:
+                    logger.warning("暂时不支持骰子表情解析")
+                case RealMessageType.shake:
+                    # 预计等价于戳一戳
+                    logger.warning("暂时不支持窗口抖动解析")
+                case RealMessageType.share:
+                    logger.warning("暂时不支持链接解析")
+                case RealMessageType.forward:
+                    messages = await self._get_forward_message(sub_message)
+                    if not messages:
+                        logger.warning("转发消息内容为空或获取失败")
+                        return None
+                    ret_seg = await self.handle_forward_message(messages)
+                    if ret_seg:
+                        seg_message.append(ret_seg)
+                    else:
+                        logger.warning("转发消息处理失败")
+                case RealMessageType.node:
+                    logger.warning("不支持转发消息节点解析")
+                case _:
+                    logger.warning(f"未知消息类型: {sub_message_type}")
         return seg_message
 
     async def handle_text_message(self, raw_message: dict) -> Seg:
@@ -415,7 +382,7 @@ class RecvHandler:
         if image_sub_type == 0:
             """这部分认为是图片"""
             return Seg(type="image", data=image_base64)
-        elif image_sub_type == 1:
+        elif image_sub_type not in [4, 9]:
             """这部分认为是表情包"""
             return Seg(type="emoji", data=image_base64)
         else:
@@ -450,39 +417,26 @@ class RecvHandler:
                 else:
                     return None
 
-    async def get_forward_message(self, raw_message: dict) -> Dict[str, Any] | None:
-        forward_message_data: Dict = raw_message.get("data")
-        if not forward_message_data:
-            logger.warning("转发消息内容为空")
-            return None
-        forward_message_id = forward_message_data.get("id")
-        request_uuid = str(uuid.uuid4())
-        payload = json.dumps(
-            {
-                "action": "get_forward_msg",
-                "params": {"message_id": forward_message_id},
-                "echo": request_uuid,
-            }
-        )
+    async def handle_record_message(self, raw_message: dict) -> Seg | None:
+        """
+        处理语音消息
+        Parameters:
+            raw_message: dict: 原始消息
+        Returns:
+            seg_data: Seg: 处理后的消息段
+        """
+        message_data: dict = raw_message.get("data")
+        file: str = message_data.get("file")
         try:
-            await self.server_connection.send(payload)
-            response: dict = await get_response(request_uuid)
-        except TimeoutError:
-            logger.error("获取转发消息超时")
-            return None
+            record_detail = await get_record_detail(self.server_connection, file)
+            audio_base64: str = record_detail.get("base64")
         except Exception as e:
-            logger.error(f"获取转发消息失败: {str(e)}")
+            logger.error(f"语音消息处理失败: {str(e)}")
             return None
-        logger.debug(
-            f"转发消息原始格式：{json.dumps(response)[:80]}..."
-            if len(json.dumps(response)) > 80
-            else json.dumps(response)
-        )
-        response_data: Dict = response.get("data")
-        if not response_data:
-            logger.warning("转发消息内容为空或获取失败")
+        if not audio_base64:
+            logger.error("语音消息处理失败，未获取到音频数据")
             return None
-        return response_data.get("messages")
+        return Seg(type="voice", data=audio_base64)
 
     async def handle_reply_message(self, raw_message: dict) -> List[Seg] | None:
         # sourcery skip: move-assign-in-block, use-named-expression
@@ -805,13 +759,57 @@ class RecvHandler:
                 seg_list.append(full_seg_data)
         return Seg(type="seglist", data=seg_list), image_count
 
-    async def message_process(self, message_base: MessageBase) -> None:
+    async def _get_forward_message(self, raw_message: dict) -> Dict[str, Any] | None:
+        forward_message_data: Dict = raw_message.get("data")
+        if not forward_message_data:
+            logger.warning("转发消息内容为空")
+            return None
+        forward_message_id = forward_message_data.get("id")
+        request_uuid = str(uuid.uuid4())
+        payload = json.dumps(
+            {
+                "action": "get_forward_msg",
+                "params": {"message_id": forward_message_id},
+                "echo": request_uuid,
+            }
+        )
         try:
-            await self.maibot_router.send_message(message_base)
+            await self.server_connection.send(payload)
+            response: dict = await get_response(request_uuid)
+        except TimeoutError:
+            logger.error("获取转发消息超时")
+            return None
         except Exception as e:
+            logger.error(f"获取转发消息失败: {str(e)}")
+            return None
+        logger.debug(
+            f"转发消息原始格式：{json.dumps(response)[:80]}..."
+            if len(json.dumps(response)) > 80
+            else json.dumps(response)
+        )
+        response_data: Dict = response.get("data")
+        if not response_data:
+            logger.warning("转发消息内容为空或获取失败")
+            return None
+        return response_data.get("messages")
+
+    async def message_process(self, message_base: MessageBase) -> None:
+        if not await self.maibot_router.send_message(message_base):
             logger.error(f"发送消息失败: {str(e)}")
             logger.error("请检查与MaiBot之间的连接")
+            self.maibot_connected = False
             return None
 
-
 recv_handler = RecvHandler()
+
+health_reporter = FastAPI()
+
+@health_reporter.get("/health")
+def health_check():
+    if recv_handler.maibot_connected:
+        return {"status": "ok"}
+    else:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "disconnected", "reason": "MaiBot connection failed"},
+        )
